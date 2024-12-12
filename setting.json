@@ -1,0 +1,7 @@
+{
+    "python.condaPath": "C:\\Users\\Johma\\anaconda3\\Scripts\\conda.exe",
+    "python.pythonPath": "C:\\Users\\Johma\\anaconda3\\envs\\test_ai\\python.exe",
+    "python.analysis.extraPaths": [
+        "C:\\Users\\Johma\\anaconda3\\envs\\test_ai\\Lib\\site-packages"
+    ]
+}
