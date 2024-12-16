@@ -1,5 +1,15 @@
-import torch.nn as nn
+import json
+import sys
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+
+import ctranslate2
+import gc
+import torch.nn as nn
 import torch
 from datasets import Dataset
 import pandas as pd
@@ -13,6 +23,8 @@ from transformers import (
     AutoModelForCausalLM,
     PreTrainedModel,
     BitsAndBytesConfig,
+    AutoConfig,
+    PretrainedConfig
 )
 import numpy as np
 import torch.nn.functional as F
@@ -81,26 +93,115 @@ def prepare_labels(dataset):
 
              label_sizes[col] = len(set(dataset[col]))
 
-     return label_sizes            
+     return label_sizes       
+ 
+class MultiLabelCharacterConfig(PretrainedConfig):
+    model_type = "multilabel_character"
+    
+    def __init__(
+        self,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=512,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.max_position_embeddings = max_position_embeddings      
+        
+        
+    @classmethod
+    def from_pretrained(cls, pretrained_model_path, **kwargs):
+       try:
+           config_path = os.path.join(pretrained_model_path, "config.json")
+           
+           if os.path.exists(config_path):
+               with open(config_path, "r") as f:
+                   config = json.load(f)
+               return cls(**config)
+           
+           config_dict = kwargs.pop("config_dict", None)
+           if config_dict is None:
+            return cls(**kwargs)
+           return cls(**config_dict)  
+       
+       except Exception as e:
+           print(f"Config読み込みエラーが発生しました: {str(e)}")  
+           raise
 
 
 class MultiLabelCharacterModel(PreTrainedModel):
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data = module.weight.data.to(torch.float32)
+            if module.bias is not None:
+                module.bias.data = module.bias.data.to(torch.float32)
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data = module.weight.data.to(torch.float32)
+            module.bias.data = module.bias.data.to(torch.float32)
+    
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        try:
+            config = kwargs.get("config")
+            if config is None:
+                config = MultiLabelCharacterConfig.from_pretrained(pretrained_model_name_or_path)
+            
+            base_model = kwargs.get("base_model")
+            if base_model is None:
+                raise ValueError("base_model is required for MultiLabelCharacterModel")
+            
+            num_labels_dict = kwargs.get("num_labels_dict", {
+                "emotion": 8,
+                "tone": 4,
+                "key_phrases": 10,
+                "chara_name": 5,
+                "speakstyle": 3
+            })
+            
+            model = cls(config=config, base_model=base_model, num_labels_dict=num_labels_dict)
+            return model
+            
+        except Exception as e:
+            print(f"モデルのロードエラー: {str(e)}")
+            raise
+    
+    def generate(self, *args, **kwargs):
+        if hasattr(self.transformer, "generate"):
+            return self.transformer.generate(*args, **kwargs)
+        elif hasattr(self.base_model, "generate"):
+            return self.base_model.generate(*args, **kwargs)
+        else:
+            raise NotImplementedError("generate method not implemented")
+    
     def __init__(self,config, base_model, num_labels_dict):
+        if not base_model:
+            raise ValueError("base_model cannot be None")
+        if not num_labels_dict:
+            raise ValueError("num_labels_dict cannot be None")
         super().__init__(config)
         self.transformer = base_model.transformer if hasattr(base_model, 'transformer') else base_model
         self.config = config
-        
-        for param in self.transformer.parameters():
-            param.requires_grad = False
 
         self.classifiers = nn.ModuleDict({
-            label: nn.Linear(self.config.hidden_size, num_labels).to(dtype=torch.bfloat16)
+            label: nn.Linear(self.config.hidden_size, num_labels).to(torch.float32)
             for label, num_labels in num_labels_dict.items()
         })
         
         for classifier in self.classifiers.values():
-          for param in classifier.parameters():
-              param.requires_grad = True
+            for param in classifier.parameters():
+                param.requires_grad = True
+                param.data = param.data.to(torch.float32)
         
     def gradient_checkpointing_enable(self, **kwargs):
        if hasattr(self.transformer, "gradient_checkpointing_enable"):
@@ -108,7 +209,14 @@ class MultiLabelCharacterModel(PreTrainedModel):
 
     def forward(self, input_ids, attention_mask,labels=None, **kwargs):
         
-        outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True,use_cache=False)
+        with torch.set_grad_enabled(self.training):
+            outputs = self.transformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+                )
             
         hidden_state = outputs.hidden_states[-1][:, 0, :]
         
@@ -116,14 +224,18 @@ class MultiLabelCharacterModel(PreTrainedModel):
             label: classifier(hidden_state)
             for label, classifier in self.classifiers.items()
         }
-        loss = torch.tensor(0.0, device=hidden_state.device, requires_grad=True)
+        loss = None
         if labels is not None:
+            loss = torch.tensor(0.0, device=hidden_state.device, dtype=torch.float32,requires_grad=True)
             loss_fct = nn.CrossEntropyLoss()
             for label_name, label_logits in logits.items():
                 if labels.get(label_name) is not None:
-                    loss += loss + loss_fct(label_logits, labels[label_name])
-            
-        return {"loss": loss, "logits": logits}
+                    label_loss = loss_fct(label_logits.float(), labels[label_name])
+                    loss = loss + label_loss
+            return {"loss": loss, "logits": logits}
+        
+        return {"loss": torch.tensor(0.0, device=hidden_state.device, dtype=torch.float32, requires_grad=True), "logits": logits}
+        
 
 class MultiLabelTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -144,26 +256,26 @@ def train_model():
     train_dataset = dataset.select(range(train_size))
     eval_dataset = dataset.select(range(train_size, len(dataset)))
     
-    bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
-        llm_int8_has_fp16_weight=False,
-        llm_int8_enable_fp32_cpu_offload=False,
-    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     
     device_map = "auto"
     
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_enable_fp32_cpu_offload = True,
+        llm_int8_compute_dtype=torch.float32,
+    )
+    
 
-    model = "tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.2"
+    model = "tokyotech-llm/Swallow-MS-7b-v0.1"
     base_model = AutoModelForCausalLM.from_pretrained(
         model, 
         quantization_config=bnb_config,
         device_map=device_map,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         attn_implementation="eager",
-        max_position_embeddings=2048,
-        rope_scaling={"type": "linear", "factor": 2.0,"original_max_position_embeddings": 2048}
+        low_cpu_mem_usage=True
         )
     
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
@@ -174,65 +286,23 @@ def train_model():
     tokenized_eval_dataset = create_model_inputs(tokenizer, eval_dataset)
     num_labels_dict = prepare_labels(dataset)
     
-    """ print("Model's module names:")
-    for name, _ in base_model.named_modules():
-        print(name) """
-    
-    
-    # only fine-tune the lora layers
-    """  target_modules = [
-        "self_attn.q_proj",
-        "self_attn.v_proj",
-        "self_attn.k_proj",
-        "self_attn.o_proj",
-        "mlp.gate_proj",
-        "mlp.up_proj",
-        "mlp.down_proj"
-    ]
-
-    lora_config = LoraConfig(
-        r=64,
-        lora_alpha=128,
-        target_modules=target_modules,
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-    ) """
-    
-   # base_model = get_peft_model(base_model, lora_config)
-   # base_model.save_pretrained("./character_model_lora")
-    
     model = MultiLabelCharacterModel(base_model.config,base_model, num_labels_dict)
     
-    
-    # only fine-tune the lora layers
-    """  for name,param in model.named_parameters():
-        if "lora" in name or "classifier" in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False """
-            
-    for name, param in model.named_parameters():
-        if "classifier" in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
-    model = model.float()
+    model = model.to_empty(device=device).train()
 
     training_args = TrainingArguments(
         output_dir="./results",
-        learning_rate=1e-5,             
+        learning_rate=2e-5,             
         per_device_train_batch_size=1,
         gradient_accumulation_steps=32,
         max_grad_norm=0.3,              
-        num_train_epochs=5,
+        num_train_epochs=3,
         eval_strategy="steps",
         eval_steps=100,
         save_steps=100,
         save_total_limit=2,
         fp16=False,
+        bf16=True,
         load_best_model_at_end=True,
         metric_for_best_model="loss",
         greater_is_better=False,
@@ -240,11 +310,11 @@ def train_model():
         logging_steps=10,
         logging_first_step=True,
         # optimizer設定
-        optim="adamw_8bit",
-        warmup_ratio=0.1,              
+        optim="adamw_hf",
+        warmup_ratio=0.03,              
         weight_decay=0.01,
         ddp_find_unused_parameters=False,
-        group_by_length=False,
+        group_by_length=True,
         dataloader_num_workers=0,        
     )
 
@@ -257,8 +327,24 @@ def train_model():
     )
 
     trainer.train()
-
+    
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    print("saving 8bit model")
+    
     trainer.save_model("./character_model_full")
+    
+    config = {
+        "quantization": "8bit",
+        "original_model": "tokyotech-llm/Swallow-MS-7b-v0.1",
+        "model_type": "MultiLabelCharacterModel",
+        "classifiers": list(model.classifiers.keys())
+    }
+    
+    with open("./character_model_full/config.json", "w") as f:
+        json.dump(config, f)
+    
     return base_model,tokenizer
 
 def load_trained_model():
@@ -266,104 +352,77 @@ def load_trained_model():
     try: 
     
         model_name = "./character_model_full"
-    
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        
+        config = AutoConfig.from_pretrained(model_name)
+        
         bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
-        llm_int8_has_fp16_weight=False,
-        llm_int8_enable_fp32_cpu_offload=True
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload = True,
         )
-    
-     
-        device_map = {
-        'model.embed_tokens': 'cpu',
-        'model.norm': 'cpu',
-        'lm_head': 'cpu'
-        }
-        for i in range(30):
-            device_map[f'model.layers.{i}'] = 'cpu'
-        for i in range(30, 32):
-            device_map[f'model.layers.{i}'] = 0
-    
+        
         base_model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        device_map=device_map,
-        trust_remote_code=True,
-        quantization_config=bnb_config,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-        use_cache=False,
-        max_memory={0: "10GB", "cpu": "32GB"}
+            model_name,
+            config=config,
+            trust_remote_code=True,
+            device_map="auto",
+            use_safetensors=True,
+            quantization_config=bnb_config,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+        
+        dataset, label_encoders = prepare_dataset()
+        num_labels_dict = prepare_labels(dataset)
+        
+        with torch.no_grad():
+            model = MultiLabelCharacterModel(   
+        config=base_model.config,
+        base_model=base_model,
+        num_labels_dict=num_labels_dict
         )
     
-        # only fine-tune the lora layers
-        """ target_modules = [
-       "self_attn.q_proj",
-        "self_attn.v_proj",
-        "self_attn.k_proj",
-        "self_attn.o_proj",
-        "mlp.gate_proj",
-        "mlp.up_proj",
-        "mlp.down_proj"
-        ]
-        lora_config = LoraConfig(
-        r=32,
-        lora_alpha=64,
-        lora_dropout=0.1,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=True
-        ) 
-    
-        base_model = PeftModel.from_pretrained(
-       base_model,
-       "./character_model_lora",
-       is_trainable=False,
-       config=lora_config,
-        )"""
-    
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
         tokenizer.pad_token = tokenizer.eos_token
     
-        return base_model, tokenizer
+        return model, tokenizer
 
     except Exception as e:
-        print(e)
-    raise
-
-
+        print(f"エラーが発生しました: {str(e)}")
+        raise e
 
 def generate_response(text,model,tokenizer):
     
-    device = next(model.parameters()).device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
     
     character_name = "ユニ"
     
     prompt = f"あなたは{character_name}です。以下の質問に答えてください:\n{text}"
     
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     
     gen_config = GenerationConfig(
-        max_new_tokens=256,
-        temperature=0.8,
+       max_length=512,
+        temperature=0.7,
         top_p=0.9,
-        top_k=40,
-        repetition_penalty=1.1,
         do_sample=True,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id
     )
     
-    with torch.no_grad():
-        outputs = model.generate(
-                                 input_ids=inputs["input_ids"],
-                                 attention_mask=inputs["attention_mask"],
-                                 generation_config=gen_config,
-                                 pad_token_id=tokenizer.pad_token_id,
-                                 eos_token_id=tokenizer.eos_token_id,
-                                 )
+    output = model.generate(
+         input_ids=inputs["input_ids"],
+         attention_mask=inputs["attention_mask"],
+         generation_config=gen_config,
+     )
+    
+    response = tokenizer.decode(output[0], skip_special_tokens=True)
         
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        return response
+    return response
     
 
 def predict_character(text_sample, model, tokenizer,label_enocders):
