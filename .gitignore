@@ -2,3 +2,7 @@ results/*
 character_model1/*
 character_model_lora/*
 character_model_full/*
+character_model_gguf/*
+character_model_bin/*
+__pycache__/*
+fast*

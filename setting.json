@@ -1,7 +1,15 @@
 {
-    "python.condaPath": "C:\\Users\\Johma\\anaconda3\\Scripts\\conda.exe",
-    "python.pythonPath": "C:\\Users\\Johma\\anaconda3\\envs\\test_ai\\python.exe",
-    "python.analysis.extraPaths": [
-        "C:\\Users\\Johma\\anaconda3\\envs\\test_ai\\Lib\\site-packages"
-    ]
+  "python.defaultInterpreterPath": "/home/johmaru/anaconda3/envs/test_ai/bin/python",
+  "python.condaPath": "/home/johmaru/anaconda3/bin/conda",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "/home/johmaru/anaconda3/envs/test_ai/lib/python3.9/site-packages"
+  ],
+  "terminal.integrated.profiles.linux": {
+    "bash": {
+      "path": "bash",
+      "icon": "terminal-bash"
+    }
+  },
+  "terminal.integrated.defaultProfile.linux": "bash"
 }
